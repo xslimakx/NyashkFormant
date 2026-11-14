@@ -36,6 +36,8 @@ struct Gui {
     env: [f32; ENV_N],
     env_ok: bool,
     last_env: f64,
+    hz: f32,
+    last_hz: f64,
 }
 
 fn set_norm<P: Param>(setter: &ParamSetter, p: &P, v: f32) {
@@ -282,7 +284,7 @@ pub fn create(params: Arc<NyashkFormantParams>, meters: Arc<Meters>) -> Option<B
     let size_state = editor_state.clone();
     create_egui_editor(
         editor_state,
-        Gui { in_lv: 0.0, out_lv: 0.0, env: [-120.0; ENV_N], env_ok: false, last_env: -10.0 },
+        Gui { in_lv: 0.0, out_lv: 0.0, env: [-120.0; ENV_N], env_ok: false, last_env: -10.0, hz: 0.0, last_hz: -10.0 },
         |ctx, _| {
             let mut v = egui::Visuals::dark();
             v.panel_fill = BG;
@@ -318,6 +320,38 @@ pub fn create(params: Arc<NyashkFormantParams>, meters: Arc<Meters>) -> Option<B
             DEMO.call_once(|| {
                 if let Some(v) = std::env::var("NYASHK_DEMO_SHIFT").ok().and_then(|v| v.parse::<f32>().ok()) {
                     set_norm(setter, &p.shift, p.shift.preview_normalized(v));
+                }
+                // NYASHK_DEMO_SET="transpose=7,keep=0,algo=4,..." (screenshots of other states)
+                for kv in std::env::var("NYASHK_DEMO_SET").unwrap_or_default().split(',') {
+                    let Some((k, v)) = kv.split_once('=') else { continue };
+                    let Ok(v) = v.trim().parse::<f32>() else { continue };
+                    let fp = match k.trim() {
+                        "transpose" => Some(&p.transpose),
+                        "detune" => Some(&p.detune),
+                        "shift" => Some(&p.shift),
+                        "tilt" => Some(&p.tilt),
+                        "follow" => Some(&p.follow),
+                        "air" => Some(&p.air),
+                        "drive" => Some(&p.drive),
+                        "mix" => Some(&p.mix),
+                        "out" => Some(&p.out_gain),
+                        _ => None,
+                    };
+                    if let Some(fp) = fp {
+                        set_norm(setter, fp, fp.preview_normalized(v));
+                        continue;
+                    }
+                    match k.trim() {
+                        "formanton" => set_b(setter, &p.formant_on, v > 0.5),
+                        "keep" => set_b(setter, &p.keep_formants, v > 0.5),
+                        "colour" => set_b(setter, &p.colour_on, v > 0.5),
+                        "autogain" => set_b(setter, &p.auto_gain, v > 0.5),
+                        "bypass" => set_b(setter, &p.bypass, v > 0.5),
+                        "algo" => set_e(setter, &p.fmode, FormantAlgo::from_index(v as usize)),
+                        "range" => set_e(setter, &p.range, VoiceRange::from_index(v as usize)),
+                        "size" => size_state.set_requested_size((v as u32, (v * BASE_H / BASE_W) as u32)),
+                        _ => {}
+                    }
                 }
             });
             // ---- meters and the envelope
@@ -374,10 +408,10 @@ pub fn create(params: Arc<NyashkFormantParams>, meters: Arc<Meters>) -> Option<B
                 panel(ui, r02, "№ 02  FORMANT");
                 let fon = p.formant_on.value();
                 let algo = p.fmode.value();
-                if let Some(nv) = enum_combo::<FormantAlgo>(ui, "algo", rect(214.0 + 100.0, y1 + 3.0, 132.0, 22.0), algo, algo.name()) {
+                if let Some(nv) = enum_combo::<FormantAlgo>(ui, "algo", rect(214.0 + 114.0, y1 + 3.0, 128.0, 22.0), algo, algo.name()) {
                     set_e(setter, &p.fmode, nv);
                 }
-                if pill(ui, rect(214.0 + 400.0 - 12.0 - 104.0 - 6.0 - 40.0, y1 + 4.0, 40.0, 20.0), "ON", fon, "Formant processing on / off.\nOff: the formants follow the pitch like a plain pitch shifter.") {
+                if pill(ui, rect(214.0 + 400.0 - 12.0 - 104.0 - 6.0 - 40.0, y1 + 4.0, 40.0, 20.0), "ON", fon, "Formant processing on / off.\nOff: the formants are left alone (Transpose still keeps them);\nShift, Tilt and Follow do nothing.") {
                     set_b(setter, &p.formant_on, !fon);
                 }
                 let keep = p.keep_formants.value();
@@ -389,9 +423,15 @@ pub fn create(params: Arc<NyashkFormantParams>, meters: Arc<Meters>) -> Option<B
                 knob(ui, setter, &p.follow, "Follow", "fo", at(214.0 + 330.0, ky), 30.0, "How much the formants follow Transpose when KEEP FORMANTS is off.", false);
                 if !fon {
                     painter.rect_filled(Rect::from_min_max(r02.min + Vec2::new(1.0, 30.0), r02.max - Vec2::splat(1.0)), CornerRadius::same(6), Color32::from_black_alpha(150));
-                } else if keep {
-                    let fr = Rect::from_center_size(at(214.0 + 330.0, ky + 18.0), Vec2::new(96.0, 100.0));
-                    painter.rect_filled(fr, CornerRadius::same(6), Color32::from_black_alpha(140));
+                } else {
+                    if keep {
+                        let fr = Rect::from_center_size(at(214.0 + 330.0, ky + 18.0), Vec2::new(96.0, 100.0));
+                        painter.rect_filled(fr, CornerRadius::same(6), Color32::from_black_alpha(140));
+                    }
+                    if algo == FormantAlgo::Classic {
+                        let fr = Rect::from_center_size(at(214.0 + 200.0, ky + 18.0), Vec2::new(96.0, 100.0));
+                        painter.rect_filled(fr, CornerRadius::same(6), Color32::from_black_alpha(140));
+                    }
                 }
 
                 // 03 colour
@@ -415,7 +455,14 @@ pub fn create(params: Arc<NyashkFormantParams>, meters: Arc<Meters>) -> Option<B
                 panel(ui, r04, "№ 04  FORMANTS");
                 let s = p.formant_factor().clamp(0.4, 2.5);
                 let st_sh = 12.0 * s.log2();
-                painter.text(at(14.0 + 560.0 - 12.0, y2 + 14.0), Align2::RIGHT_CENTER, format!("formants x{:.2}  ({:+.1} st)", s, st_sh), mono(10.0), if (s - 1.0).abs() > 0.003 { WHITE } else { DIM });
+                let head = if byp {
+                    ("bypassed".to_string(), DIM)
+                } else if !fon {
+                    ("formant processing off".to_string(), DIM)
+                } else {
+                    (format!("formants x{:.2}  ({:+.1} st)", s, st_sh), if (s - 1.0).abs() > 0.003 { WHITE } else { DIM })
+                };
+                painter.text(at(14.0 + 560.0 - 12.0, y2 + 14.0), Align2::RIGHT_CENTER, head.0, mono(10.0), head.1);
                 let g = Rect::from_min_max(at(14.0 + 40.0, y2 + 34.0), at(14.0 + 560.0 - 14.0, y2 + h2 - 30.0));
                 painter.rect_filled(g, CornerRadius::same(3), Color32::from_rgb(8, 8, 8));
                 let (f_lo, f_hi) = (env_freq(0) as f32, env_freq(ENV_N - 1) as f32);
@@ -498,9 +545,14 @@ pub fn create(params: Arc<NyashkFormantParams>, meters: Arc<Meters>) -> Option<B
                 painter.text(at(14.0 + 64.0, ly), Align2::LEFT_CENTER, "input", mono(9.5), DIM);
                 painter.line_segment([at(14.0 + 120.0, ly), at(14.0 + 138.0, ly)], Stroke::new(2.0, WHITE));
                 painter.text(at(14.0 + 144.0, ly), Align2::LEFT_CENTER, "output", mono(9.5), DIM);
-                let hz = meters.hz.load(Ordering::Relaxed);
-                let voiced = meters.voiced.load(Ordering::Relaxed) != 0;
-                if voiced && hz > 20.0 && !byp {
+                let hz_now = meters.hz.load(Ordering::Relaxed);
+                if meters.voiced.load(Ordering::Relaxed) != 0 && hz_now > 20.0 {
+                    st.hz = if now - st.last_hz > 0.3 { hz_now } else { st.hz + (hz_now - st.hz) * 0.3 };
+                    st.last_hz = now;
+                }
+                let hz = st.hz;
+                // hold the last pitch for a moment (the detector drops out between syllables)
+                if now - st.last_hz < 0.8 && hz > 20.0 && !byp {
                     let ratio = 2f32.powf((p.transpose.value() + p.detune.value() / 100.0) / 12.0);
                     painter.text(at(14.0 + 560.0 - 14.0, ly), Align2::RIGHT_CENTER, format!("pitch {:.0} Hz -> {:.0} Hz", hz, hz * ratio), mono(9.5), DIM);
                 }

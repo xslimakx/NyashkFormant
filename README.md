@@ -51,7 +51,7 @@ Latency ≈ 27–37 ms (reported to the host), depending on the voice range.
 
 ### Tested
 
-`cargo test -p nyashkformant` checks on synthetic vowels at low and high pitch: every algorithm moves the spectral envelope by the asked amount (±25 %, LPC ±50 %) while the pitch stays within 1 %; Transpose keeps the formants; Auto Gain keeps the level within 1.5 dB for ±7 / +12 st and ±6 st formant shifts; no clicks in any mode; neutral settings are transparent; plus fuzzing of the engine.
+`cargo test -p nyashkformant` checks on synthetic vowels at low and high pitch: every algorithm moves the spectral envelope by the asked amount (±25 %, LPC ±50 %) while the pitch stays within 1 %; Transpose keeps the formants; Auto Gain keeps the level within 1.5 dB for −7 / +7 / +12 st transposes and ±6 st formant shifts; no clicks in any mode, at ±12 st with full Tilt, or while every knob is automated; the same at 44.1 and 96 kHz; neutral settings are transparent; plus fuzzing of the engine.
 
 ---
 

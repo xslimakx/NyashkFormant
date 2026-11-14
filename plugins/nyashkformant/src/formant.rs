@@ -413,12 +413,18 @@ impl FormantShifter {
                 let e_src = self.env[i0] * (1.0 - fr) + self.env[i1] * fr;
                 (e_src - self.env[k]).clamp(-9.2, 2.3)
             };
-            self.lm[k] = lg;
+            // Above 8 kHz the envelope is mostly breath and noise floor: allow less and less boost
+            // there (+20 dB at 8 kHz -> 0 dB at 16 kHz), or a big upward shift with Tilt turns the
+            // top octave into hiss.
+            let cap = 2.3 * (1.0 - ((fk - 8000.0) / 8000.0).clamp(0.0, 1.0));
+            self.lm[k] = lg.min(cap);
         }
-        // above 14 kHz: the gain reached there, held (no step)
+        // above 14 kHz: fade the gain reached there back to unity by 16 kHz (no step)
         let hold = self.lm[kmax];
+        let kend = ((16000.0 * n as f64 / fs) as usize).max(kmax + 1);
         for k in kmax + 1..=half {
-            self.lm[k] = hold;
+            let t = ((k - kmax) as f64 / (kend - kmax) as f64).min(1.0);
+            self.lm[k] = hold * (1.0 - t);
         }
         // The gain curve as an impulse response must stay well inside the grain, or the grain edges
         // get cut off after filtering (a click every period). Make the linear gain, window its

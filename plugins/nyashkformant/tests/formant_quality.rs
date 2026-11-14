@@ -150,6 +150,47 @@ fn worst_jump(x: &[f32]) -> f64 {
     worst
 }
 
+/// Clicks: a step in the waveform is broadband, so it adds energy at the very top of the spectrum.
+/// The shifter leaves everything above 16 kHz at unity gain, so the energy above 17 kHz of the
+/// output should match the input's, block by block (20 ms). Returns the worst excess in dB.
+/// Run with Auto Gain off (it lifts the whole output, the untouched top octave included).
+fn hf_excess(x: &[f32], y: &[f32]) -> f64 {
+    let hp = |z: &[f32]| -> Vec<f64> {
+        // 4th-order Butterworth high-pass at 17 kHz (two biquads)
+        let mut v: Vec<f64> = z.iter().map(|s| *s as f64).collect();
+        for q in [0.5412f64, 1.3066] {
+            let w0 = 2.0 * PI * 17000.0 / FS;
+            let (cw, sw) = (w0.cos(), w0.sin());
+            let alpha = sw / (2.0 * q);
+            let (b0, b1, b2) = ((1.0 + cw) / 2.0, -(1.0 + cw), (1.0 + cw) / 2.0);
+            let (a0, a1, a2) = (1.0 + alpha, -2.0 * cw, 1.0 - alpha);
+            let (mut x1, mut x2, mut y1, mut y2) = (0.0, 0.0, 0.0, 0.0);
+            for s in v.iter_mut() {
+                let o = (b0 * *s + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2) / a0;
+                x2 = x1;
+                x1 = *s;
+                y2 = y1;
+                y1 = o;
+                *s = o;
+            }
+        }
+        v
+    };
+    let (hx, hy) = (hp(x), hp(y));
+    let n = hx.len().min(hy.len());
+    let blk = 960;
+    let floor = hx.iter().map(|v| v * v).sum::<f64>() / n as f64 * blk as f64 * 0.05;
+    let g2 = 1.0;
+    let mut worst = -100.0f64;
+    for b in (blk..n - blk).step_by(blk) {
+        let ex: f64 = hx[b..b + blk].iter().map(|v| v * v).sum();
+        let ey: f64 = hy[b..b + blk].iter().map(|v| v * v).sum();
+        let v = 10.0 * ((ey + floor * g2) / ((ex + floor) * g2)).log10();
+        worst = worst.max(v);
+    }
+    worst
+}
+
 const AH: [(f64, f64); 3] = [(700.0, 90.0), (1150.0, 110.0), (2700.0, 160.0)];
 
 #[test]
@@ -209,10 +250,18 @@ fn no_clicks_in_any_mode() {
     let ref_jump = worst_jump(&x);
     for mode in [FormantMode::Classic, FormantMode::Smooth, FormantMode::Detailed, FormantMode::Lpc, FormantMode::Bend] {
         for (st, tr) in [(5.0f32, 0.0f32), (-5.0, 0.0), (3.0, -5.0), (-3.0, 7.0)] {
-            let y = run(&x, &params(mode, st, tr));
-            let j = worst_jump(&y);
+            let mut p = params(mode, st, tr);
+            p.auto_gain = false;
+            let y = run(&x, &p);
             assert!(y.iter().all(|v| v.is_finite()));
-            assert!(j < (ref_jump * 1.6).max(14.0), "{mode:?} shift {st} transpose {tr}: jump {j:.1} (input {ref_jump:.1})");
+            if tr == 0.0 {
+                let h = hf_excess(&x, &y);
+                assert!(h < 3.0, "{mode:?} shift {st}: {h:.1} dB more energy above 17 kHz (clicks)");
+            } else {
+                // transposed: the top octave moves too, so look at the waveform steps instead
+                let j = worst_jump(&y);
+                assert!(j < (ref_jump * 1.6).max(14.0), "{mode:?} shift {st} transpose {tr}: jump {j:.1} (input {ref_jump:.1})");
+            }
         }
     }
 }
@@ -228,5 +277,107 @@ fn neutral_settings_are_transparent() {
     let snr = 10.0 * (sig / err).log10();
     eprintln!("neutral: SNR {snr:.1} dB");
     assert!(snr > 25.0, "neutral settings change the sound: SNR {snr:.1} dB");
+}
+
+
+/// Moving the knobs while the voice plays (shift sweep, transpose steps, algorithm switches)
+/// must not click either.
+#[test]
+fn automation_does_not_click() {
+    let x = vowel(50.0, 4.0, &AH);
+    let mut p = params(FormantMode::Detailed, 0.0, 0.0);
+    p.auto_gain = false;
+    let mut e = Engine::new(FS, p.min_hz);
+    e.set_params(&p);
+    let mut y = Vec::with_capacity(x.len());
+    // the spectral modes leave the top octave alone, so clicks show there (Classic resamples the
+    // whole grain and transposing changes the pulse rate: both are checked by the waveform steps
+    // in no_clicks_in_any_mode)
+    let modes = [FormantMode::Smooth, FormantMode::Detailed, FormantMode::Lpc, FormantMode::Bend];
+    for (i, &s) in x.iter().enumerate() {
+        if i % 512 == 0 {
+            let t = i as f64 / FS;
+            p.formant_semis = (12.0 * (2.0 * PI * 0.4 * t).sin()) as f32;
+            p.transpose = 0.0;
+            p.formant_mode = modes[(t / 0.45) as usize % modes.len()];
+            p.formant_preserve = (t / 1.3) as usize % 2 == 0;
+            p.formant_follow = 0.5;
+            p.formant_tilt = (0.8 * (2.0 * PI * 0.3 * t).cos()) as f32;
+            e.set_params(&p);
+        }
+        y.push(e.process_frame([s, s], 1)[0]);
+    }
+    let h = hf_excess(&x[(0.2 * FS) as usize..], &y[(0.2 * FS) as usize..]);
+    eprintln!("automation: {h:+.1} dB above 17 kHz");
+    assert!(y.iter().all(|v| v.is_finite()));
+    assert!(h < 3.0, "{h:.1} dB more energy above 17 kHz (clicks)");
+}
+
+/// The same checks at 44.1 and 96 kHz (FFT sizes and analysis lengths depend on the rate).
+#[test]
+fn other_sample_rates() {
+    for fs in [44100.0f64, 96000.0] {
+        // resample the 48 kHz vowel by linear interpolation (a smooth signal: good enough)
+        let x48 = vowel(50.0, 3.0, &AH);
+        let n = (x48.len() as f64 * fs / FS) as usize;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let pos = i as f64 * FS / fs;
+                let k = (pos as usize).min(x48.len() - 2);
+                let fr = (pos - k as f64) as f32;
+                x48[k] * (1.0 - fr) + x48[k + 1] * fr
+            })
+            .collect();
+        for (st, tr) in [(4.0f32, 0.0f32), (-4.0, 0.0), (0.0, 7.0)] {
+            let p = params(FormantMode::Detailed, st, tr);
+            let mut e = Engine::new(fs, p.min_hz);
+            e.set_params(&p);
+            let lat = e.latency_samples() as usize;
+            let mut y = Vec::new();
+            for &s in x.iter().chain(std::iter::repeat(&0.0).take(lat)) {
+                y.push(e.process_frame([s, s], 1)[0]);
+            }
+            let y = &y[lat..];
+            assert!(y.iter().all(|v| v.is_finite()));
+            // back to 48 kHz for the measurements
+            let back = |z: &[f32]| -> Vec<f32> {
+                let m = (z.len() as f64 * FS / fs) as usize;
+                (0..m)
+                    .map(|i| {
+                        let pos = i as f64 * fs / FS;
+                        let k = (pos as usize).min(z.len() - 2);
+                        let fr = (pos - k as f64) as f32;
+                        z[k] * (1.0 - fr) + z[k + 1] * fr
+                    })
+                    .collect()
+            };
+            let (xb, yb) = (back(&x), back(y));
+            let got = envelope_shift(&xb, &yb);
+            let pr = f0(&yb) / f0(&xb);
+            let want_p = 2f64.powf(tr as f64 / 12.0);
+            eprintln!("{fs} Hz shift {st:+} transpose {tr:+}: envelope {got:+.2} st, pitch ratio {pr:.3}");
+            assert!((got - st as f64).abs() < 0.25 * st.abs().max(2.0) as f64, "{fs}: envelope moved {got:.2}");
+            assert!((pr / want_p - 1.0).abs() < 0.015, "{fs}: pitch ratio {pr:.3}");
+        }
+    }
+}
+
+#[test]
+fn big_shifts_do_not_click() {
+    let x = vowel(50.0, 2.5, &AH);
+    for mode in [FormantMode::Classic, FormantMode::Smooth, FormantMode::Detailed, FormantMode::Lpc, FormantMode::Bend] {
+        for (st, tilt) in [(12.0f32, 0.0f32), (-12.0, 0.0), (9.0, 0.8), (-9.0, -0.8), (12.0, -0.8), (-12.0, 0.8)] {
+            if mode == FormantMode::Classic && st > 0.0 {
+                continue; // resampling moves real content up there (checked by waveform steps)
+            }
+            let mut p = params(mode, st, 0.0);
+            p.formant_tilt = tilt;
+            p.auto_gain = false; // it lifts everything, the untouched top octave included
+            let y = run(&x, &p);
+            let h = hf_excess(&x, &y);
+            eprintln!("{mode:?} shift {st:+} tilt {tilt:+}: {h:+.1} dB above 17 kHz");
+            assert!(h < 3.0, "{mode:?} shift {st} tilt {tilt}: {h:.1} dB more energy above 17 kHz (clicks)");
+        }
+    }
 }
 
