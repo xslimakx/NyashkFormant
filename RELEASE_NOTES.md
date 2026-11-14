@@ -1,5 +1,9 @@
 # Release notes
 
+## 1.0.1
+
+- A window size saved by an older version is opened with the right proportions.
+
 ## 1.0.0
 
 First release: the formant section of NyashkTune 1.x as its own plugin, reworked.
