@@ -1373,7 +1373,11 @@ impl Engine {
             p
         };
         let hs = d / r;
-        let hg = (p.max(hs).ceil() as i64).max(8);
+        // grain half-length: one input period. For a downward shift the grains are spaced wider
+        // than that; stretching the grain to fill the gap (as before: max(p, hs)) put several
+        // input periods into every grain and rebuilt the ORIGINAL pitch - an octave down came out
+        // unchanged and -9 st was mostly lost. A little stretch (up to 1.35 p: down to about -5 st no gaps at all) keeps mild shifts smooth.
+        let hg = ((p.max(hs.min(1.35 * p))).ceil() as i64).max(8);
         let follow = if self.p.formant_preserve { 0.0 } else { self.p.formant_follow as f64 };
         let s_raw = if self.p.formant_on { 2f64.powf((self.p.formant_semis + vformant) as f64 / 12.0) * r.powf(follow) } else { 1.0 };
         let mode = self.p.formant_mode;

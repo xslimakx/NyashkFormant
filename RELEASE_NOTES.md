@@ -1,3 +1,8 @@
+## 1.0.3
+
+- **Big downward transpositions fixed:** Transpose -12 st came out at the original pitch and -9 / -11 st were mostly lost: the grains were stretched to fill the wider spacing and so carried several of the original periods, rebuilding the original pitch. Grains now stay about one period long; every mode lands within 0.1 st from -12 to +12 st.
+- New behaviour tests: Transpose / Detune land on pitch in all five modes, an octave down really is an octave down.
+
 ## 1.0.2
 
 - Frequency grid labels read 1k / 2k / 10k instead of 1.0k / 2.0k / 10.0k (formant labels keep one decimal, e.g. 2.7k).
