@@ -1,3 +1,7 @@
+## 1.0.2
+
+- Frequency grid labels read 1k / 2k / 10k instead of 1.0k / 2.0k / 10.0k (formant labels keep one decimal, e.g. 2.7k).
+
 # Release notes
 
 ## 1.0.1

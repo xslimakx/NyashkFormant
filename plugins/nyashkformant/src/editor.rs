@@ -273,7 +273,13 @@ fn peaks(curve: &[(f32, f32)]) -> Vec<f32> {
 
 fn fmt_hz(f: f32) -> String {
     if f >= 1000.0 {
-        format!("{:.1}k", f / 1000.0)
+        let k = f / 1000.0;
+        // whole kHz without the decimal ("1k", "10k"), others with one ("2.7k")
+        if (k - k.round()).abs() < 0.05 {
+            format!("{}k", k.round() as i32)
+        } else {
+            format!("{k:.1}k")
+        }
     } else {
         format!("{:.0}", f)
     }
