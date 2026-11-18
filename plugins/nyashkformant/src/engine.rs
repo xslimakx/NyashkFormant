@@ -723,7 +723,11 @@ impl Engine {
     // YIN pitch frames
     // --------------------------------------------------------------------------------------
     fn run_yin(&mut self) {
-        let min_tau = ((self.fs_dec / self.p.max_hz.clamp(200.0, 2000.0) as f64) as usize).max(2);
+        // Always look up to at least 1600 Hz (about G6): a voice above the search range is read an
+        // octave low, and the grains then come out an octave low too - the "jumps an octave for no
+        // reason" on high notes, falsetto or a range set too low. The range still decides which
+        // notes are corrected.
+        let min_tau = ((self.fs_dec / self.p.max_hz.clamp(1600.0, 2000.0) as f64) as usize).max(2);
         let max_tau = (((self.fs_dec / self.p.min_hz.max(40.0) as f64) as usize) + 2).min(600);
         let need = YIN_W + max_tau + 2;
         if (self.dec_w as usize) < need {
@@ -768,7 +772,11 @@ impl Engine {
         }
         let cands = &cands[..nc];
 
-        let mut best: Option<(usize, f32)> = cands.iter().copied().find(|c| c.1 < 0.15);
+        // YIN's "first dip under the threshold", but only a dip that is about as clean as the best
+        // one: a shallow dip at half the period (strong 2nd harmonic) used to win and start the
+        // note an octave high
+        let dmin = cands.iter().map(|c| c.1).fold(1.0f32, f32::min);
+        let mut best: Option<(usize, f32)> = cands.iter().copied().find(|c| c.1 < 0.15 && c.1 < dmin + 0.05);
         if best.is_none() {
             best = cands.iter().copied().filter(|c| c.1 < 0.30).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         }
@@ -795,6 +803,30 @@ impl Engine {
             }
         }
 
+        // octave check on the pick: a clear dip at half the period means the pick was two periods
+        // (the note would start an octave low): take the shorter one. (The opposite case - a
+        // shallow dip at half the true period winning - is handled by the first-dip rule above.)
+        if let Some((tau, v)) = best {
+            let dip_near = |t: f32| -> Option<(usize, f32)> {
+                cands.iter().copied().filter(|c| (c.0 as f32 / t).ln().abs() < 0.06).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            };
+            if let Some(h) = dip_near(tau as f32 * 0.5) {
+                if h.1 < 0.2 && h.1 < v + 0.06 {
+                    best = Some(h);
+                }
+            }
+        }
+        // a weak dip exactly an octave away from the period we are following is a transition
+        // smear (two notes / a consonant in one window), not a real octave move: skip the frame
+        // instead of jumping (a real leap shows a clean dip within a few ms)
+        if let Some((tau, v)) = best {
+            if self.prev_tau > 0.0 && v > 0.12 {
+                let r = (tau as f32 / self.prev_tau).ln().abs();
+                if (r - std::f32::consts::LN_2).abs() < 0.08 {
+                    best = None;
+                }
+            }
+        }
         let gate_open = rms_db > self.p.gate_db as f64;
         let mut frame = Frame { time: self.w, period: self.last_period as f32, voiced: false };
         if let (Some((tau, _)), true) = (best, gate_open) {

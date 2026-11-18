@@ -1,3 +1,7 @@
+## 1.0.4
+
+- Той самий захист від октавних помилок детектора, що й у Tune: високі ноти та початки нот зі слабкою основною частотою більше не читаються на октаву вище або нижче.
+
 ## 1.0.3
 
 - **Big downward transpositions fixed:** Transpose -12 st came out at the original pitch and -9 / -11 st were mostly lost: the grains were stretched to fill the wider spacing and so carried several of the original periods, rebuilding the original pitch. Grains now stay about one period long; every mode lands within 0.1 st from -12 to +12 st.
