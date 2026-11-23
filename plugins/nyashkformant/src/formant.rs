@@ -131,6 +131,10 @@ pub struct FormantShifter {
     aenv: Vec<f64>,
     a_n: usize,
     a_ok: bool,
+    /// The analysed envelope belongs to a signal whose frequencies are `warp` times lower than
+    /// the one being filtered (the input before a resampling pitch shift by `warp`): what is
+    /// there now is E(f / warp), what is wanted is E(f / s) (or the Bend warp of it).
+    pub warp: f64,
 }
 
 impl FormantShifter {
@@ -150,6 +154,7 @@ impl FormantShifter {
             aenv: vec![0.0; max_n / 2 + 1],
             a_n: 0,
             a_ok: false,
+            warp: 1.0,
         }
     }
 
@@ -404,7 +409,8 @@ impl FormantShifter {
                 fk / st
             };
             let lg = if use_a {
-                (self.aenv_at(src_f, fs) - self.aenv_at(fk, fs)).clamp(-9.2, 2.3)
+                // the envelope of the (original) analysed voice: wanted at src_f, present at fk / warp
+                (self.aenv_at(src_f, fs) - self.aenv_at(fk / self.warp, fs)).clamp(-9.2, 2.3)
             } else {
                 let pos = (src_f * n as f64 / fs).clamp(0.0, nyq_bin);
                 let i0 = pos.floor() as usize;

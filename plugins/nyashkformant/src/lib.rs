@@ -317,6 +317,7 @@ pub struct NyashkFormant {
     meters: Arc<Meters>,
     engine: Option<engine::Engine>,
     cur_min_hz: f32,
+    cur_latency: u32,
     env_clock: u32,
     sample_rate: f32,
 }
@@ -328,6 +329,7 @@ impl Default for NyashkFormant {
             meters: Arc::new(Meters::default()),
             engine: None,
             cur_min_hz: 60.0,
+            cur_latency: 0,
             env_clock: 0,
             sample_rate: 48000.0,
         }
@@ -378,8 +380,10 @@ impl Plugin for NyashkFormant {
     fn initialize(&mut self, _layout: &AudioIOLayout, config: &BufferConfig, context: &mut impl InitContext<Self>) -> bool {
         self.cur_min_hz = self.params.lowest_hz();
         self.sample_rate = config.sample_rate;
-        let eng = engine::Engine::new(config.sample_rate as f64, self.cur_min_hz);
-        context.set_latency_samples(eng.latency_samples());
+        let mut eng = engine::Engine::new(config.sample_rate as f64, self.cur_min_hz);
+        eng.set_params(&self.params.engine_params());
+        self.cur_latency = eng.latency_samples();
+        context.set_latency_samples(self.cur_latency);
         self.engine = Some(eng);
         true
     }
@@ -400,9 +404,13 @@ impl Plugin for NyashkFormant {
         if (ep.min_hz - self.cur_min_hz).abs() > 0.5 {
             self.cur_min_hz = ep.min_hz;
             eng.set_lowest_hz(ep.min_hz);
-            context.set_latency_samples(eng.latency_samples());
         }
         eng.set_params(&ep);
+        // the latency depends on the algorithm, Transpose and the formant switch
+        if eng.latency_samples() != self.cur_latency {
+            self.cur_latency = eng.latency_samples();
+            context.set_latency_samples(self.cur_latency);
+        }
 
         let (mut ipk, mut opk) = (0.0f32, 0.0f32);
         for mut channels in buffer.iter_samples() {

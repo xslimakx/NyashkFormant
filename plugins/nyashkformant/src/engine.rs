@@ -359,6 +359,32 @@ pub struct Engine {
     abuf: Vec<f32>,
     gbuf: [Vec<f32>; MAX_CH],
 
+    // ---- low-latency path (every algorithm but Classic): an optional pitch stage (a read head
+    // through the delayed input at the transpose ratio, jumping by whole periods with a
+    // cross-fade) then a short-frame formant stage (the spectral envelope moved, the rest kept)
+    fast: bool,
+    pitch_on: bool,
+    pitch_zero: u32,
+    lat_rs: i64,
+    rs_started: bool,
+    rs_pos: f64,
+    rs_xf_pos: f64,
+    rs_xf_left: usize,
+    rs_xf_len: usize,
+    rs_xf_pow: bool,
+    rs_ctl: usize,
+    rs_period: f64,
+    fn_n: usize,
+    fbuf: [Vec<f32>; MAX_CH],
+    fmono: Vec<f32>,
+    fw: usize,
+    fcnt: usize,
+    fola: [Vec<f32>; MAX_CH],
+    fwin: Vec<f32>,
+    fper: f64,
+    fr: f64,
+    switch_fade: f32,
+
     // wet-signal colour
     air: [Biquad; MAX_CH],
     air_cache: f32,
@@ -388,6 +414,15 @@ pub struct Engine {
     tp_max: (f64, f64), // last peak (value, time)
     tp_min: (f64, f64), // last trough
     clock: f64,     // lightly smoothed pitch used only to *choose* the note (not to correct it)
+}
+
+/// Frame of the low-latency formant stage: ~10.7 ms (512 at 48 kHz).
+fn fast_n(fs: f64) -> usize {
+    let mut n = 128usize;
+    while (n as f64) < 0.0105 * fs {
+        n <<= 1;
+    }
+    n
 }
 
 #[inline]
@@ -453,6 +488,28 @@ impl Engine {
             abuf: vec![0.0; 4096],
             shifter: FormantShifter::new(((8.0 * fs / 40.0).ceil() as usize + 64).next_power_of_two()),
             gbuf: [vec![0.0; ((8.0 * fs / 40.0).ceil() as usize + 64).next_power_of_two()], vec![0.0; ((8.0 * fs / 40.0).ceil() as usize + 64).next_power_of_two()]],
+            fast: false,
+            pitch_on: false,
+            pitch_zero: 0,
+            lat_rs: 1024,
+            rs_started: false,
+            rs_pos: 0.0,
+            rs_xf_pos: 0.0,
+            rs_xf_left: 0,
+            rs_xf_len: 1,
+            rs_xf_pow: false,
+            rs_ctl: 0,
+            rs_period: fs / 150.0,
+            fn_n: fast_n(fs),
+            fbuf: [vec![0.0; fast_n(fs)], vec![0.0; fast_n(fs)]],
+            fmono: vec![0.0; 16384],
+            fw: 0,
+            fcnt: 0,
+            fola: [vec![0.0; 2 * fast_n(fs)], vec![0.0; 2 * fast_n(fs)]],
+            fwin: (0..fast_n(fs)).map(|i| (0.5 - 0.5 * (2.0 * PI * i as f64 / fast_n(fs) as f64).cos()) as f32).collect(),
+            fper: fs / 150.0,
+            fr: 1.0,
+            switch_fade: 1.0,
             air: [Biquad::default(); MAX_CH],
             air_cache: f32::NAN,
             rng: 0x1234_5678,
@@ -484,12 +541,26 @@ impl Engine {
         e
     }
 
-    /// Lowest pitch to track; decides the latency (about 2.2 periods). Allocation-free.
+    /// Lowest pitch to track; decides the latency. Allocation-free.
     pub fn set_lowest_hz(&mut self, hz: f32) {
         let hz = hz.clamp(40.0, 400.0) as f64;
-        self.latency = (2.2 * self.fs / hz).ceil() as i64;
+        self.lat_rs = (1.45 * self.fs / hz).ceil() as i64 + 32;
         self.hp_fc = (hz * 0.6).max(25.0);
+        self.update_latency();
         self.reset();
+    }
+
+    /// Classic: the PSOLA grains (about 2.2 periods). The other algorithms: the formant frame
+    /// (~11 ms), plus the pitch stage only while Transpose / Detune are in use, nothing at all
+    /// with formants off and no transpose.
+    fn update_latency(&mut self) {
+        let lowest = self.lat_rs - 32;
+        self.latency = if !self.fast {
+            (2.2 / 1.45 * lowest as f64).ceil() as i64
+        } else {
+            let f = if self.p.formant_on { self.fn_n as i64 } else { 0 };
+            f + if self.pitch_on { self.lat_rs } else { 0 }
+        };
     }
 
     pub fn latency_samples(&self) -> u32 {
@@ -525,6 +596,7 @@ impl Engine {
         self.ag = 1.0;
         self.shifter.invalidate();
         self.cur_r = 1.0;
+        self.reset_fast();
         for a in self.air.iter_mut() {
             a.z1 = 0.0;
             a.z2 = 0.0;
@@ -560,7 +632,32 @@ impl Engine {
                 a.z2 = z2;
             }
         }
+        let fast = p.formant_mode != FormantMode::Classic;
+        let want_pitch = p.transpose != 0.0 || p.fine_cents != 0.0;
+        let formant_changed = p.formant_on != self.p.formant_on;
         self.p = p.clone();
+        let mut changed = false;
+        if fast != self.fast {
+            self.fast = fast;
+            changed = true;
+        }
+        // the pitch stage comes in at once, and goes only after Transpose / Detune have been back
+        // at zero for half a second (automation passing through zero does not toggle the latency)
+        if want_pitch {
+            self.pitch_zero = 0;
+            if !self.pitch_on {
+                self.pitch_on = true;
+                changed = true;
+            }
+        } else if self.pitch_on && self.pitch_zero as f64 > 0.5 * self.fs {
+            self.pitch_on = false;
+            changed = true;
+        }
+        if changed || (formant_changed && self.fast) {
+            self.update_latency();
+            self.reset_fast();
+            self.switch_fade = 0.0;
+        }
     }
 
     pub fn allowed_pitch_classes(&self) -> u16 {
@@ -610,7 +707,15 @@ impl Engine {
         self.w += 1;
         let o = self.w - 1; // output time index == current input sample
 
-        if self.w & 15 == 0 {
+        let mut fast_wet = [0.0f32; MAX_CH];
+        if self.fast {
+            if self.p.transpose == 0.0 && self.p.fine_cents == 0.0 {
+                self.pitch_zero = self.pitch_zero.saturating_add(1);
+            }
+            fast_wet = self.fast_tick(nch);
+            self.switch_fade = (self.switch_fade + 1.0 / (0.01 * self.fs as f32)).min(1.0);
+        }
+        if !self.fast && self.w & 15 == 0 {
             self.advance_marks();
         }
 
@@ -622,10 +727,10 @@ impl Engine {
             self.nmarks = 0; // resync marks to the stream
             self.advance_marks();
         }
-        if self.started && o as f64 >= self.syn[0].next_decision {
+        if self.started && !self.fast && o as f64 >= self.syn[0].next_decision {
             self.place_grain(0, o, nch);
         }
-        if self.started {
+        if self.started && !self.fast {
             for v in 1..=NUM_VOICES {
                 if self.p.voices_on && self.p.voices[v - 1].on && !self.p.bypass {
                     if !self.vact[v] {
@@ -678,7 +783,7 @@ impl Engine {
             let (mut pd, mut pwet) = (0.0f64, 0.0f64);
             for c in 0..nch {
                 let d = rd(&self.ring[c], self.ring_mask, o - self.latency) as f64;
-                let w = self.ola[c][oi] as f64;
+                let w = if self.fast { fast_wet[c] } else { self.ola[c][oi] } as f64;
                 pd += d * d;
                 pwet += w * w;
             }
@@ -695,7 +800,7 @@ impl Engine {
         }
         self.vcomp += (comp_t - self.vcomp) * (1.0 / (0.03 * self.fs as f32)).min(1.0);
         for c in 0..nch {
-            let mut wet = self.ola[c][oi] * self.ag;
+            let mut wet = if self.fast { fast_wet[c] * self.switch_fade } else { self.ola[c][oi] } * self.ag;
             self.ola[c][oi] = 0.0;
             if any_v || self.vcomp != 1.0 {
                 wet *= self.vcomp;
@@ -717,6 +822,247 @@ impl Engine {
             out[c] = y * out_gain;
         }
         out
+    }
+
+
+    // --------------------------------------------------------------------------------------
+    // Low-latency path
+    // --------------------------------------------------------------------------------------
+    fn reset_fast(&mut self) {
+        self.rs_started = false;
+        self.rs_xf_left = 0;
+        self.rs_ctl = 0;
+        for c in 0..MAX_CH {
+            self.fbuf[c].iter_mut().for_each(|v| *v = 0.0);
+            self.fola[c].iter_mut().for_each(|v| *v = 0.0);
+        }
+        self.fmono.iter_mut().for_each(|v| *v = 0.0);
+        self.fw = 0;
+        self.fcnt = 0;
+        self.shifter.invalidate();
+    }
+
+    #[inline]
+    fn cubic(&self, ch: usize, pos: f64) -> f32 {
+        let i = pos.floor() as i64;
+        let f = (pos - i as f64) as f32;
+        let last = self.w - 1;
+        let at = |k: i64| rd(&self.ring[ch], self.ring_mask, k.min(last));
+        let (y0, y1, y2, y3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        let c1 = 0.5 * (y2 - y0);
+        let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+        let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+        ((c3 * f + c2) * f + c1) * f + y1
+    }
+
+    /// Moves the pitch stage's read head by about `amount` samples, at the offset where the
+    /// waveform continues best, with a cross-fade.
+    fn rs_jump(&mut self, amount: f64, period: f64, voiced: bool, rate: f64) {
+        let win = (period.min(0.012 * self.fs)).max(32.0) as i64;
+        let search = if voiced { (0.15 * period).max(4.0) as i64 } else { (0.5 * period) as i64 };
+        let cand = self.rs_pos + amount;
+        let newest = self.w - 3;
+        let m = self.ring_mask;
+        let p0 = self.rs_pos.round() as i64;
+        let mut e0 = 1e-12f64;
+        let mut j = 0;
+        while j < win {
+            let v = rd(&self.mono, m, p0 + j) as f64;
+            e0 += v * v;
+            j += 2;
+        }
+        let (mut best, mut best_s) = (0i64, f64::MIN);
+        for dlt in -search..=search {
+            let c0 = cand.round() as i64 + dlt;
+            if c0 + win + 4 >= newest {
+                continue;
+            }
+            let (mut dot, mut e1) = (0.0f64, 1e-12f64);
+            let mut j = 0;
+            while j < win {
+                let a = rd(&self.mono, m, p0 + j) as f64;
+                let b = rd(&self.mono, m, c0 + j) as f64;
+                dot += a * b;
+                e1 += b * b;
+                j += 2;
+            }
+            let sc = dot / (e0 * e1).sqrt() - 0.05 * (dlt.abs() as f64 / search.max(1) as f64);
+            if sc > best_s {
+                best_s = sc;
+                best = dlt;
+            }
+        }
+        if best_s == f64::MIN {
+            return;
+        }
+        let new_pos = self.rs_pos + amount + best as f64;
+        let r_dev = (rate - 1.0).abs().max(1e-3);
+        let mut len = if voiced { period.clamp(0.004 * self.fs, 0.015 * self.fs).min(0.8 * period / r_dev) } else { 0.012 * self.fs };
+        let room = (self.w as f64 - new_pos.max(self.rs_pos)) - 8.0;
+        if rate > 1.0 {
+            len = len.min(room / (rate - 1.0));
+        }
+        let len = len.max(16.0) as usize;
+        self.rs_xf_pos = self.rs_pos;
+        self.rs_pos = new_pos;
+        self.rs_xf_len = len;
+        self.rs_xf_left = len;
+        self.rs_xf_pow = best_s < 0.6;
+    }
+
+    /// One sample of the low-latency path: returns the wet signal.
+    fn fast_tick(&mut self, nch: usize) -> [f32; MAX_CH] {
+        let rate = 2f64.powf((self.p.transpose as f64 + self.p.fine_cents as f64 / 100.0) / 12.0);
+        let mut x = [0.0f32; MAX_CH];
+        let mut period;
+        if self.pitch_on {
+            if !self.rs_started {
+                // before the stream the ring holds silence: start at once, `lat_rs` behind
+                self.rs_started = true;
+                self.rs_pos = (self.w - 1 - self.lat_rs) as f64;
+                self.rs_ctl = 0;
+            }
+            if self.rs_ctl == 0 {
+                let (voiced, pq) = self.query(self.rs_pos - 0.5 * (YIN_W * self.decim) as f64);
+                let p = if voiced { pq } else { self.fallback() };
+                self.rs_period = p;
+                if self.rs_xf_left == 0 {
+                    let d = self.w as f64 - self.rs_pos;
+                    let l = self.lat_rs as f64;
+                    if voiced {
+                        if d < l - 0.55 * p && rate > 1.0 {
+                            let k = ((l - d) / p).round().max(1.0);
+                            self.rs_jump(-(k * p), p, true, rate);
+                        } else if d > l + 0.55 * p && rate < 1.0 {
+                            let k = ((d - l) / p).round().max(1.0);
+                            self.rs_jump(k * p, p, true, rate);
+                        }
+                    } else {
+                        // breath / consonants: keep the head inside its window
+                        let lim = 0.6 * (self.lat_rs - 32) as f64;
+                        if (d - l).abs() > lim {
+                            self.rs_jump(d - l, self.fallback(), false, rate);
+                        }
+                    }
+                }
+            }
+            self.rs_ctl = (self.rs_ctl + 1) % 32;
+            for c in 0..nch {
+                x[c] = self.cubic(c, self.rs_pos);
+            }
+            if self.rs_xf_left > 0 {
+                let t = 1.0 - self.rs_xf_left as f64 / self.rs_xf_len as f64;
+                let (gi, go) = if self.rs_xf_pow { ((0.5 * PI * t).sin(), (0.5 * PI * t).cos()) } else { (0.5 - 0.5 * (PI * t).cos(), 0.5 + 0.5 * (PI * t).cos()) };
+                for c in 0..nch {
+                    let old = self.cubic(c, self.rs_xf_pos);
+                    x[c] = x[c] * gi as f32 + old * go as f32;
+                }
+                self.rs_xf_pos += rate;
+                self.rs_xf_left -= 1;
+            }
+            self.rs_pos += rate;
+            let newest = (self.w - 3) as f64;
+            if self.rs_pos > newest {
+                self.rs_pos = newest - (self.lat_rs - 32) as f64;
+            }
+            period = self.rs_period / rate;
+        } else {
+            for c in 0..nch {
+                x[c] = rd(&self.ring[c], self.ring_mask, self.w - 1);
+            }
+            let (voiced, pq) = if self.fcnt == 0 { self.query(self.w as f64) } else { (true, self.fper) };
+            period = if voiced { pq } else { self.fallback() };
+            if self.fcnt != 0 {
+                period = self.fper;
+            }
+        }
+        if !self.p.formant_on {
+            return x;
+        }
+
+        // formant stage
+        let n = self.fn_n;
+        let fi = self.fw % n;
+        for c in 0..MAX_CH {
+            self.fbuf[c][fi] = if c < nch { x[c] } else { 0.0 };
+        }
+        let mut mono = 0.0;
+        for c in 0..nch {
+            mono += x[c];
+        }
+        self.fmono[self.fw % 16384] = mono / nch as f32;
+        self.fper = period;
+        self.fr = if self.pitch_on { rate } else { 1.0 };
+        self.fw += 1;
+        self.fcnt += 1;
+        if self.fcnt >= n / 4 {
+            self.fcnt = 0;
+            self.fast_frame(nch);
+        }
+        let oi = self.fw % (2 * n);
+        let mut out = [0.0f32; MAX_CH];
+        for c in 0..nch {
+            out[c] = self.fola[c][oi];
+            self.fola[c][oi] = 0.0;
+        }
+        out
+    }
+
+    /// One formant frame: the envelope from the last ~3 periods, the frame filtered by
+    /// E(f / s) / E(f), overlap-added (hop n / 4).
+    fn fast_frame(&mut self, nch: usize) {
+        let n = self.fn_n;
+        let r = self.fr;
+        let follow = if self.p.formant_preserve { 0.0 } else { self.p.formant_follow as f64 };
+        // formants: the asked shift, following the pitch by Follow (the filter also takes back
+        // the r the resampling moved them by: see `warp`)
+        let s = 2f64.powf(self.p.formant_semis as f64 / 12.0) * r.powf(follow);
+        self.disp_s = 2f64.powf(self.p.formant_semis as f64 / 12.0) * r.powf(follow);
+        let mode = self.p.formant_mode;
+        let period = self.fper.max(16.0);
+        let amax = self.abuf.len().min(self.shifter.max_len());
+        if self.pitch_on {
+            // the envelope of the original voice around the audio this frame came from: dense
+            // harmonics, so it is accurate even when the shift goes far up
+            let p_in = (period * r).max(16.0);
+            let alen = ((3.0 * p_in) as usize).clamp(n, amax);
+            let centre = self.rs_pos - 0.5 * n as f64 * r;
+            let end = ((centre + 0.5 * alen as f64) as i64).min(self.w - 1);
+            for i in 0..alen {
+                self.abuf[i] = rd(&self.mono, self.ring_mask, end - alen as i64 + 1 + i as i64);
+            }
+            self.shifter.warp = r;
+            let (ab, sh) = (&self.abuf[..alen], &mut self.shifter);
+            sh.analyse(ab, p_in, self.fs, mode);
+        } else {
+            // envelope analysis on the input itself, ~3 periods (at least the frame)
+            let alen = ((3.0 * period) as usize).clamp(n, amax);
+            let end = self.fw;
+            for i in 0..alen {
+                self.abuf[i] = self.fmono[(end + 16384 - alen + i) % 16384];
+            }
+            self.shifter.warp = 1.0;
+            let (ab, sh) = (&self.abuf[..alen], &mut self.shifter);
+            sh.analyse(ab, period, self.fs, mode);
+        }
+        let start = self.fw;
+        for c in 0..nch {
+            for j in 0..n {
+                self.gbuf[c][j] = self.fbuf[c][(start + j) % n] * self.fwin[j];
+            }
+        }
+        if (s.ln()).abs() > 1e-4 || self.p.formant_tilt != 0.0 || self.pitch_on {
+            let (g0, g1) = self.gbuf.split_at_mut(1);
+            let right = if nch == 2 { Some(&mut g1[0][..n]) } else { None };
+            let _ = self.shifter.process2(&mut g0[0][..n], right, period, self.fs, mode, s.clamp(0.25, 4.0), self.p.formant_tilt as f64);
+        }
+        // hop n / 4 with a Hann window: the windows sum to 2
+        for c in 0..nch {
+            for j in 0..n {
+                let idx = (start + j) % (2 * n);
+                self.fola[c][idx] += 0.5 * self.gbuf[c][j];
+            }
+        }
     }
 
     // --------------------------------------------------------------------------------------

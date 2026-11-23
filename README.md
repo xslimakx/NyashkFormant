@@ -47,7 +47,18 @@ input → YIN pitch detection → pitch marks (one per period)
       → auto gain (wet level follows the input over ~150 ms) → Air / Drive → mix
 ```
 
-Latency ≈ 27–37 ms (reported to the host), depending on the voice range.
+### Latency (since 1.1.0)
+
+The four modern algorithms (Smooth, Detailed, LPC, Bend) now run on a low-latency path:
+
+| Setting | Latency at 48 kHz |
+|---|---|
+| Formant shift only (Transpose / Detune at 0) | **≈ 10.7 ms** (one ~10 ms analysis frame) |
+| Formants off, no transpose | **0 ms** |
+| With Transpose / Detune | ≈ 20–38 ms (10.7 ms + pitch stage, set by the voice range: Soprano shortest, Bass / Generic longest) |
+| Classic (PSOLA) | 13–40 ms, as before |
+
+The formant stage is a short STFT (≈ 10 ms Hann frames, 75 % overlap) that applies E(f / s) / E(f) per frame, with the envelope taken from ~3 periods of the voice. Transpose uses a resampling read head inside a short delay line that jumps by whole periods at the best-matching point (crossfaded), and the formant envelope is read from the original voice so Transpose keeps the formants. The latency is reported to the host and updated when you switch the path; turning Transpose back to 0 drops the pitch stage after 0.5 s.
 
 ### Tested
 
