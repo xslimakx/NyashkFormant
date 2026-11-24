@@ -277,13 +277,18 @@ impl FormantShifter {
     /// lows more (-). Returns false when the grain is too long for the preallocated FFT (the
     /// caller then falls back to the classic path).
     #[allow(clippy::too_many_arguments)]
-    pub fn process2(&mut self, left: &mut [f32], right: Option<&mut [f32]>, period: f64, fs: f64, mode: FormantMode, s: f64, tilt: f64) -> bool {
+    pub fn process2(&mut self, left: &mut [f32], mut right: Option<&mut [f32]>, period: f64, fs: f64, mode: FormantMode, s: f64, tilt: f64) -> bool {
         let l = left.len();
-        match self.filter(left, right, l, period, fs, mode, s, tilt) {
-            Some((n, off)) => {
-                let _ = n;
+        match self.filter(left, right.as_deref_mut(), l, period, fs, mode, s, tilt) {
+            Some((_, off)) => {
                 for (i, g) in left.iter_mut().enumerate() {
                     *g = self.re[off + i] as f32;
+                }
+                // the right channel rides in the imaginary part: it has to come back too
+                if let Some(r) = right {
+                    for (i, g) in r.iter_mut().enumerate().take(l) {
+                        *g = self.im[off + i] as f32;
+                    }
                 }
                 true
             }

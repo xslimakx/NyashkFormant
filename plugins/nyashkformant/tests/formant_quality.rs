@@ -436,3 +436,23 @@ fn latency_and_robustness() {
     }
 }
 
+
+/// A mono source on both channels stays identical on both outputs in every mode (1.1.0 left the
+/// right channel unprocessed on the fast path), and a right-only signal is processed too.
+#[test]
+fn stereo_channels_match() {
+    let x = vowel(52.0, 1.5, &AH);
+    for mode in [FormantMode::Classic, FormantMode::Smooth, FormantMode::Detailed, FormantMode::Lpc, FormantMode::Bend] {
+        for tr in [0.0f32, 4.0] {
+            let p = params(mode, 3.0, tr);
+            let mut e = Engine::new(FS, p.min_hz);
+            e.set_params(&p);
+            let mut worst = 0.0f32;
+            for &v in &x {
+                let o = e.process_frame([v, v], 2);
+                worst = worst.max((o[0] - o[1]).abs());
+            }
+            assert!(worst < 1e-5, "{mode:?} transpose {tr}: left and right differ by {worst}");
+        }
+    }
+}
