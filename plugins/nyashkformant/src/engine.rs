@@ -911,6 +911,18 @@ impl Engine {
     }
 
     /// One sample of the low-latency path: returns the wet signal.
+    /// The low-latency path places no grains, so it reports the voice to the meters / display
+    /// itself (the grain path does this in `compute_ratio`). Without it the formant display
+    /// stayed empty in Smooth / Detailed / LPC.
+    fn fast_meters(&mut self, voiced: bool, period: f64) {
+        self.meters.voiced = voiced;
+        if voiced {
+            self.meters.hz = (self.fs / period.max(1.0)) as f32;
+        }
+        self.meters.target = 0.0;
+        self.meters.corr = (self.p.transpose as f64 + self.p.fine_cents as f64 / 100.0) as f32;
+    }
+
     fn fast_tick(&mut self, nch: usize) -> [f32; MAX_CH] {
         let rate = 2f64.powf((self.p.transpose as f64 + self.p.fine_cents as f64 / 100.0) / 12.0);
         let mut x = [0.0f32; MAX_CH];
@@ -926,6 +938,7 @@ impl Engine {
                 let (voiced, pq) = self.query(self.rs_pos - 0.5 * (YIN_W * self.decim) as f64);
                 let p = if voiced { pq } else { self.fallback() };
                 self.rs_period = p;
+                self.fast_meters(voiced, pq);
                 if self.rs_xf_left == 0 {
                     let d = self.w as f64 - self.rs_pos;
                     let l = self.lat_rs as f64;
@@ -971,6 +984,9 @@ impl Engine {
                 x[c] = rd(&self.ring[c], self.ring_mask, self.w - 1);
             }
             let (voiced, pq) = if self.fcnt == 0 { self.query(self.w as f64) } else { (true, self.fper) };
+            if self.fcnt == 0 {
+                self.fast_meters(voiced, pq);
+            }
             period = if voiced { pq } else { self.fallback() };
             if self.fcnt != 0 {
                 period = self.fper;
